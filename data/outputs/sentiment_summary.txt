@@ -1,0 +1,17 @@
+Sentiment Analysis Summary (as of 2025-03-23):
+We analyzed news about Apple (AAPL), the U.S. economy, and the NASDAQ market.
+- Latest Sentiment: 0.01 (positive)
+- Average Sentiment: -0.04
+- Sentiment Distribution Stats:
+  - Mean: -0.05
+  - Median: -0.02
+  - Skewness: 0.39
+What this means:
+The sentiment score ranges from -1 (very negative) to 1 (very positive), with 0 being neutral.
+Thresholds: Negative < -0.15, Positive > -0.00
+A positive sentiment suggests that recent news is favorable for Apple stock, the U.S. economy, and the NASDAQ market.
+Check the plots in 'data/outputs/' for detailed visualizations:
+- final_sentiment_plot.png: Overall sentiment trend with confidence intervals
+- individual_sentiment_plot.png: Sentiment for AAPL, U.S. Economy, and NASDAQ
+- sentiment_distribution_histogram.png: Distribution of sentiment scores
+- sentiment_correlation_heatmap.png: Cross-source correlations

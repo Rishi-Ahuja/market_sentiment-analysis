@@ -24,6 +24,11 @@ wheels/
 logs/
 *.log
 
+# Config files with sensitive data
+config/config.yaml
+config/*.yaml
+*.env
+
 # Data files
 data/raw/
 data/processed/
