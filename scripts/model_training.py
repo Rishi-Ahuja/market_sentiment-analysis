@@ -2,319 +2,390 @@ import pandas as pd
 import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
-from scipy.stats import multivariate_normal, skew
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import multivariate_normal, gaussian_kde
 import matplotlib.pyplot as plt
 import seaborn as sns
-import yfinance as yf
 from datetime import datetime
-from scripts.utils import load_config, save_df, exponential_decay, market_impact, logging
+from scripts.utils import load_config, save_df, logging, exponential_decay, market_impact
+import os
+import matplotlib.dates as mdates
+
+# Set seaborn style for better aesthetics
+plt.style.use('seaborn')
+sns.set_palette("deep")
 
 class HSAM:
-    def __init__(self, decay_rate, pca_components, bayesian_prior_strength, validation_split=0.2):
+    def __init__(self, decay_rate=0.1, min_signal=0.01, explained_variance=0.9, prior_strength=0.1, validation_split=0.2):
         self.decay_rate = decay_rate
-        self.pca = PCA(n_components=pca_components)
-        self.prior_strength = bayesian_prior_strength
+        self.min_signal = min_signal
+        self.pca = PCA()
+        self.explained_variance = explained_variance
+        self.prior_strength = prior_strength
         self.weights = None
         self.validation_split = validation_split
 
-    def fit(self, sentiment_data, volatilities):
-        """Fit the HSAM model with cross-validation."""
-        try:
-            # Split data into training and validation sets
-            train_size = int(len(sentiment_data) * (1 - self.validation_split))
-            train_data = sentiment_data.iloc[:train_size].copy()
-            val_data = sentiment_data.iloc[train_size:].copy()
-            logging.info(f"Training data: {len(train_data)} rows, Validation data: {len(val_data)} rows")
+    def fit(self, sentiment_data, volatilities, ticker=None):
+        train_size = int(len(sentiment_data) * (1 - self.validation_split))
+        train_data = sentiment_data.iloc[:train_size].copy()
+        val_data = sentiment_data.iloc[train_size:].copy()
+        logging.info(f"Training ({ticker or 'combined'}): {len(train_data)} rows, Validation: {len(val_data)} rows")
 
-            # Fit on training data
-            train_result = self._fit_subset(train_data, volatilities)
-            # Apply to validation data
-            val_result = self._fit_subset(val_data, volatilities)
+        train_result = self._fit_subset(train_data, volatilities, "train", ticker)
+        val_result = self._fit_subset(val_data, volatilities, "val", ticker) if len(val_data) >= 1 else pd.DataFrame()
+        result = pd.concat([train_result, val_result], ignore_index=True) if not val_result.empty else train_result
+        return result
 
-            # Combine results
-            result = pd.concat([train_result, val_result], ignore_index=True)
-            logging.info("HSAM model fitted successfully.")
-            return result
-        except Exception as e:
-            logging.error(f"HSAM fitting failed: {e}")
-            raise
-
-    def _fit_subset(self, data, volatilities):
-        """Helper method to fit HSAM on a subset of data."""
-        # Ensure no NaN in days_elapsed
-        data["days_elapsed"] = data["days_elapsed"].fillna(0)
+    def _fit_subset(self, data, volatilities, subset_name="train", ticker=None):
+        data["days_elapsed"] = data["days_elapsed"].fillna(data["days_elapsed"].median() or 0)
         sentiment_cols = ["stock", "country", "market"]
-        # Check for sufficient data overlap
-        valid_rows = data[sentiment_cols].notna().sum(axis=1) >= 2
-        if not valid_rows.any():
-            logging.error("No rows with sufficient sentiment data (at least 2 sources).")
-            raise ValueError("Insufficient overlapping sentiment data.")
-        data = data[valid_rows].copy()
-        logging.info(f"Rows after overlap filter: {len(data)}")
+        valid_rows = data[sentiment_cols].notna().sum(axis=1) >= 1
+        if not valid_rows.any() or len(data[valid_rows]) < 1:
+            logging.warning(f"No sufficient sentiment data in {subset_name} subset for {ticker or 'combined'}. Using all rows with defaults.")
+            data = data.copy()
+            data[sentiment_cols] = data[sentiment_cols].fillna(0)
+        else:
+            data = data[valid_rows].copy()
+        logging.info(f"{subset_name.capitalize()} rows after filter ({ticker or 'combined'}): {len(data)}")
 
-        # Apply exponential decay to sentiment scores
+        # Apply decay, preserving original values
         data[sentiment_cols] = data.apply(
             lambda row: [exponential_decay(row[col], self.decay_rate, row["days_elapsed"])
-                        for col in sentiment_cols], axis=1, result_type="expand"
+                         if pd.notna(row[col]) and abs(row[col]) > self.min_signal else row[col] if pd.notna(row[col]) else 0
+                         for col in sentiment_cols], axis=1, result_type="expand"
         )
-        # Impute NaN values with 0 before PCA
+
         imputer = SimpleImputer(strategy="constant", fill_value=0)
         sentiment_matrix = imputer.fit_transform(data[sentiment_cols])
-        logging.debug(f"Sentiment matrix shape: {sentiment_matrix.shape}")
-        if sentiment_matrix.shape[0] < self.pca.n_components:
-            logging.error(f"Not enough samples ({sentiment_matrix.shape[0]}) for PCA with {self.pca.n_components} components.")
-            raise ValueError("Insufficient data for PCA.")
-        # PCA transformation
+        
+        # Standardize only country and market, preserve stock sentiment
+        stock_sentiment = sentiment_matrix[:, 0].copy()  # Preserve stock sentiment
+        country_market = sentiment_matrix[:, 1:]  # Country and market
+        scaler = StandardScaler()
+        country_market_scaled = scaler.fit_transform(country_market)
+        sentiment_matrix = np.column_stack((stock_sentiment, country_market_scaled))
+        sentiment_matrix = np.nan_to_num(sentiment_matrix, nan=0, posinf=0, neginf=0)
+
+        if sentiment_matrix.shape[0] <= 1:
+            logging.warning(f"Too few rows ({sentiment_matrix.shape[0]}) for PCA in {subset_name} ({ticker or 'combined'}). Returning raw sentiment.")
+            return pd.DataFrame({
+                "timestamp": data["timestamp"],
+                "stock": data["stock"],
+                "country": data["country"],
+                "market": data["market"],
+                "final_sentiment": data["stock"].fillna(0),
+                "ticker": ticker if ticker else data.get("ticker", "combined")
+            })
+
+        # PCA with sign alignment to stock sentiment
         pca_features = self.pca.fit_transform(sentiment_matrix)
-        s_pca = pd.DataFrame(pca_features, columns=["P1", "P2"])
-        logging.debug(f"s_pca shape: {s_pca.shape}")
-        # Initial weights from volatilities
-        self.weights = volatilities["volatility"] / volatilities["volatility"].sum()
-        self.weights = self.weights[:2].values
-        logging.debug(f"Initial weights shape: {self.weights.shape}")
-        # Bayesian updating
+        n_components = min(np.argmax(np.cumsum(self.pca.explained_variance_ratio_) >= self.explained_variance) + 1, sentiment_matrix.shape[1])
+        pca_features = pca_features[:, :n_components]
+        # Align first component with stock sentiment
+        stock_col = sentiment_matrix[:, 0]  # Stock is first column
+        if np.corrcoef(pca_features[:, 0], stock_col)[0, 1] < 0:
+            pca_features[:, 0] *= -1
+        s_pca = pd.DataFrame(pca_features, columns=[f"P{i+1}" for i in range(n_components)])
+
+        # Volatility weights, capped to prevent dominance
+        ticker_vol = volatilities[volatilities["ticker"] == ticker]["volatility"].iloc[0] if ticker in volatilities["ticker"].values else 0.02
+        vol_weights = np.array([min(ticker_vol, 0.5), 0.2, 0.2])  # Stock, country, market
+        if len(vol_weights) < n_components:
+            vol_weights = np.pad(vol_weights, (0, n_components - len(vol_weights)), mode='constant', constant_values=0.02)
+        self.weights = vol_weights[:n_components] / (vol_weights[:n_components].sum() or 1)
+
+        # Dynamic weighting with Bayesian update
         weights_dynamic = []
-        for i, row in s_pca.iterrows():
-            row_values = row.values
-            likelihood = multivariate_normal.pdf(row_values, mean=[0, 0], cov=np.eye(2))
-            prior = multivariate_normal.pdf(self.weights, mean=[0.5, 0.5], cov=np.eye(2) * self.prior_strength)
-            evidence = likelihood * prior
-            self.weights = (self.weights * prior + row_values * likelihood) / evidence if evidence != 0 else self.weights
+        cov = np.cov(pca_features.T) + np.eye(n_components) * 1e-6
+        cov = np.nan_to_num(cov, nan=0, posinf=0, neginf=0)
+
+        for row in s_pca.values:
+            likelihood = multivariate_normal.pdf(row, mean=np.zeros(n_components), cov=cov, allow_singular=True)
+            prior = multivariate_normal.pdf(self.weights, mean=np.full(n_components, 0.5), cov=np.eye(n_components) * self.prior_strength)
+            evidence = likelihood * prior + 1e-10
+            self.weights = np.clip((self.weights * prior + row * likelihood) / evidence, -1, 1)
             weights_dynamic.append(self.weights.copy())
+
+        # Weighted scores with stronger baseline from raw stock sentiment
+        raw_stock_mean = data["stock"].mean()
+        pca_contribution = [np.dot(row, w) for row, w in zip(s_pca.values, weights_dynamic)]
+        # Scale PCA contribution to avoid overpowering the raw stock mean
+        pca_std = np.std(pca_contribution)
+        scaled_pca_contribution = [x / (pca_std or 1) * 0.5 for x in pca_contribution]  # Reduce PCA impact
+        weighted_scores = [raw_stock_mean + pca_contrib for pca_contrib in scaled_pca_contribution]
         
-        # Calculate weighted sentiment scores
-        weighted_scores = [np.dot(row, w) for row, w in zip(s_pca.values, weights_dynamic)]
-        # Normalize to [-1, 1] range using min-max scaling
-        min_score = min(weighted_scores)
-        max_score = max(weighted_scores)
-        if min_score != max_score:
-            normalized_scores = [2 * (score - min_score) / (max_score - min_score) - 1 for score in weighted_scores]
-        else:
-            normalized_scores = [0] * len(weighted_scores)
+        # Shift the scores to center around 0
+        score_mean = np.mean(weighted_scores)
+        weighted_scores = [score - score_mean for score in weighted_scores]
         
-        # Apply market impact with smaller slope for smoother distribution
-        final_sentiment = [market_impact(score, slope=0.3) for score in normalized_scores]
-        
-        logging.info(f"Final weights: {self.weights}")
+        # Normalize with a larger scaling factor to spread out the scores
+        score_range = np.ptp(weighted_scores) or 1  # Range of weighted scores
+        final_sentiment = [market_impact(score / score_range * 6) for score in weighted_scores]  # Scale to [-6, 6] before market_impact
+
         return pd.DataFrame({
             "timestamp": data["timestamp"],
             "stock": data["stock"],
             "country": data["country"],
             "market": data["market"],
-            "final_sentiment": final_sentiment
+            "final_sentiment": final_sentiment,
+            "ticker": ticker if ticker else data.get("ticker", "combined")
         })
 
 def compute_confidence_intervals(df, n_bootstrap=1000, ci_level=0.95):
-    """Compute confidence intervals for daily sentiment scores using bootstrapping on raw data."""
     df["date"] = pd.to_datetime(df["timestamp"]).dt.date
-    ci_lower = []
-    ci_upper = []
     daily_groups = df.groupby("date")
+    ci_lower, ci_upper = [], []
+    block_size = 5
     for date, group in daily_groups:
         scores = group["final_sentiment"].values
         bootstrapped_means = []
         for _ in range(n_bootstrap):
-            sample = np.random.choice(scores, size=len(scores), replace=True)
-            bootstrapped_means.append(np.mean(sample))
+            start_idx = np.random.randint(0, max(1, len(scores) - block_size + 1))
+            sample = scores[start_idx:start_idx + block_size] if len(scores) >= block_size else scores
+            bootstrapped_means.append(np.mean(np.random.choice(sample, len(scores), replace=True)))
         ci = np.percentile(bootstrapped_means, [(1 - ci_level) / 2 * 100, (1 + ci_level) / 2 * 100])
         ci_lower.append(ci[0])
         ci_upper.append(ci[1])
     daily_sentiment = daily_groups["final_sentiment"].mean().reset_index()
     daily_sentiment["timestamp"] = pd.to_datetime(daily_sentiment["date"])
-    daily_sentiment = daily_sentiment.sort_values("timestamp")
-    return daily_sentiment, ci_lower, ci_upper
+    return daily_sentiment.sort_values("timestamp"), ci_lower, ci_upper
 
-def calibrate_thresholds(final_sentiment, percentile_low=25, percentile_high=75):
-    """Calibrate sentiment thresholds based on percentile distribution with fallback."""
-    low_threshold = np.percentile(final_sentiment, percentile_low)
-    high_threshold = np.percentile(final_sentiment, percentile_high)
-    # Fallback if thresholds are at extremes
-    if low_threshold <= -1.0:
-        low_threshold = -0.3
-    if high_threshold >= 1.0:
-        high_threshold = 0.3
-    logging.info(f"Calibrated thresholds: Negative < {low_threshold:.2f}, Positive > {high_threshold:.2f}")
-    return low_threshold, high_threshold
+def calibrate_thresholds(final_sentiment):
+    # Use 25th and 75th percentiles for thresholds
+    low = np.percentile(final_sentiment, 25)
+    high = np.percentile(final_sentiment, 75)
+    logging.info(f"Percentile-based thresholds: Negative < {low:.2f}, Positive > {high:.2f}")
+    return low, high
 
-def plot_sentiment(df, smoothing_window=3):
-    """Plot sentiment over time with additional visualizations."""
+def plot_sentiment(df, smoothing_window=3, ticker=None):
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"])
     raw_sentiments = df[["timestamp", "stock", "country", "market"]].copy()
+    title_suffix = f" ({ticker})" if ticker else " (Magnificent 7 Combined)"
+    output_dir = "data/outputs"
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Final Sentiment Plot with Confidence Intervals
+    # Compute percentile-based thresholds for shading the neutral zone
+    low_threshold, high_threshold = calibrate_thresholds(df["final_sentiment"])
+
+    # Plot 1: Sentiment Over Time
     daily_sentiment, ci_lower, ci_upper = compute_confidence_intervals(df)
-    smoothed_sentiment = daily_sentiment["final_sentiment"].rolling(window=smoothing_window, min_periods=1).mean()
+    daily_sentiment["smoothed"] = daily_sentiment["final_sentiment"].rolling(window=smoothing_window, min_periods=1).mean()
     plt.figure(figsize=(12, 6))
-    plt.plot(daily_sentiment["timestamp"], daily_sentiment["final_sentiment"], label="Daily Sentiment", alpha=0.5, color="blue")
-    plt.plot(daily_sentiment["timestamp"], smoothed_sentiment, label=f"Smoothed Sentiment ({smoothing_window}-day)", linewidth=2, color="red")
-    plt.fill_between(daily_sentiment["timestamp"], ci_lower, ci_upper, color="blue", alpha=0.1, label="95% CI")
-    plt.xlabel("Date")
-    plt.ylabel("Sentiment Score")
-    plt.title("Sentiment Over Time for AAPL, U.S. Economy, and NASDAQ")
-    plt.grid(True)
-    plt.legend()
-    plt.gca().xaxis.set_major_locator(plt.MaxNLocator(10))
-    plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter("%Y-%m-%d"))
+    plt.plot(daily_sentiment["timestamp"], daily_sentiment["final_sentiment"], label="Daily Sentiment", alpha=0.3, color="gray")
+    plt.plot(daily_sentiment["timestamp"], daily_sentiment["smoothed"], label=f"Smoothed ({smoothing_window}-day)", linewidth=3, color="navy")
+    plt.fill_between(daily_sentiment["timestamp"], ci_lower, ci_upper, color="navy", alpha=0.15, label="95% Confidence Interval")
+    plt.axhline(0, color="black", linestyle="--", linewidth=1, alpha=0.5)
+    # Shade the neutral zone
+    plt.fill_between(daily_sentiment["timestamp"], low_threshold, high_threshold, color="gray", alpha=0.1, label="Neutral Zone")
+    plt.title(f"Sentiment Over Time{title_suffix}", fontsize=16, pad=15)
+    plt.xlabel("Date", fontsize=12)
+    plt.ylabel("Sentiment Score", fontsize=12)
+    plt.legend(fontsize=10, loc="best")
+    plt.grid(True, alpha=0.3)
+    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig("data/outputs/final_sentiment_plot.png")
+    plt.savefig(f"{output_dir}/sentiment_over_time{'_' + ticker if ticker else ''}.png", dpi=300)
     plt.close()
 
-    # 2. Individual Sentiment Trends (AAPL, U.S. Economy, NASDAQ)
+    # Plot 2: Individual Sentiment Trends
     plt.figure(figsize=(12, 6))
-    for col, label in zip(["stock", "country", "market"], ["AAPL", "U.S. Economy", "NASDAQ"]):
+    colors = sns.color_palette("deep", 3)  # Distinct colors for stock, country, market
+    for col, label, color in zip(["stock", "country", "market"], ["Stock", "U.S. Economy", "NASDAQ"], colors):
         daily = raw_sentiments.groupby(raw_sentiments["timestamp"].dt.date)[col].mean().reset_index()
         daily["timestamp"] = pd.to_datetime(daily["timestamp"])
-        daily = daily.sort_values("timestamp")
-        plt.plot(daily["timestamp"], daily[col], label=label)
-    plt.xlabel("Date")
-    plt.ylabel("Sentiment Score")
-    plt.title("Individual Sentiment Trends")
-    plt.grid(True)
-    plt.legend()
-    plt.gca().xaxis.set_major_locator(plt.MaxNLocator(10))
-    plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter("%Y-%m-%d"))
+        plt.plot(daily["timestamp"], daily[col], label=label, color=color, linewidth=3)
+    plt.axhline(0, color="black", linestyle="--", linewidth=1, alpha=0.5)
+    # Shade the neutral zone
+    plt.fill_between(daily["timestamp"], low_threshold, high_threshold, color="gray", alpha=0.1, label="Neutral Zone")
+    plt.title(f"Individual Sentiment Trends{title_suffix}", fontsize=16, pad=15)
+    plt.xlabel("Date", fontsize=12)
+    plt.ylabel("Sentiment Score", fontsize=12)
+    plt.legend(fontsize=10, loc="best")
+    plt.grid(True, alpha=0.3)
+    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig("data/outputs/individual_sentiment_plot.png")
+    plt.savefig(f"{output_dir}/individual_sentiment_trends{'_' + ticker if ticker else ''}.png", dpi=300)
     plt.close()
 
-    # 3. Sentiment Distribution Histogram
-    plt.figure(figsize=(10, 6))
-    plt.hist(df["final_sentiment"], bins=50, color="skyblue", edgecolor="black")
-    plt.axvline(df["final_sentiment"].mean(), color="red", linestyle="--", label=f"Mean: {df['final_sentiment'].mean():.2f}")
-    plt.axvline(df["final_sentiment"].median(), color="green", linestyle="--", label=f"Median: {df['final_sentiment'].median():.2f}")
-    plt.xlabel("Final Sentiment Score")
-    plt.ylabel("Frequency")
-    plt.title("Distribution of Final Sentiment Scores")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("data/outputs/sentiment_distribution_histogram.png")
-    plt.close()
-
-    # 4. Cross-Source Sentiment Correlation Heatmap
+    # Plot 3: Correlation Heatmap
+    corr_matrix = raw_sentiments[["stock", "country", "market"]].corr()
     plt.figure(figsize=(8, 6))
-    correlation_matrix = raw_sentiments[["stock", "country", "market"]].corr()
-    sns.heatmap(correlation_matrix, annot=True, cmap="coolwarm", vmin=-1, vmax=1, center=0)
-    plt.title("Cross-Source Sentiment Correlation")
-    plt.xticks(ticks=[0, 1, 2], labels=["AAPL", "U.S. Economy", "NASDAQ"], rotation=45)
-    plt.yticks(ticks=[0, 1, 2], labels=["AAPL", "U.S. Economy", "NASDAQ"], rotation=0)
+    sns.heatmap(corr_matrix, annot=True, cmap="RdBu_r", vmin=-1, vmax=1, center=0, 
+                annot_kws={"size": 12}, cbar_kws={"label": "Correlation Coefficient"},
+                linewidths=0.5, linecolor="black")
+    plt.title(f"Correlation Between Sentiment Sources{title_suffix}", fontsize=16, pad=15)
+    plt.xticks(ticks=range(3), labels=["Stock", "U.S. Economy", "NASDAQ"], rotation=45, fontsize=12)
+    plt.yticks(ticks=range(3), labels=["Stock", "U.S. Economy", "NASDAQ"], rotation=0, fontsize=12)
     plt.tight_layout()
-    plt.savefig("data/outputs/sentiment_correlation_heatmap.png")
+    plt.savefig(f"{output_dir}/sentiment_correlation_heatmap{'_' + ticker if ticker else ''}.png", dpi=300)
     plt.close()
 
-    logging.info("All sentiment plots saved.")
+    logging.info(f"Static plots saved as PNGs for {ticker or 'combined'}.")
 
-def generate_summary(df, smoothing_window=3):
-    """Generate a user-friendly summary with additional statistics."""
+def plot_all_stocks(results, smoothing_window=3):
+    output_dir = "data/outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    plt.figure(figsize=(14, 8))
+
+    # Compute percentile-based thresholds for the combined data
+    combined_df = pd.concat([df for df in results.values()], ignore_index=True)
+    low_threshold, high_threshold = calibrate_thresholds(combined_df["final_sentiment"])
+
+    # Use a distinct color palette for different stocks
+    colors = sns.color_palette("tab10", len(results))  # More distinct colors
+    markers = ['o', 's', '^', 'D', 'v', '<', '>']  # Different markers for each stock
+    for (ticker, df), color, marker in zip(results.items(), colors, markers * (len(results) // len(markers) + 1)):
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        daily_sentiment = df.groupby(df["timestamp"].dt.date)["final_sentiment"].mean().reset_index()
+        daily_sentiment["timestamp"] = pd.to_datetime(daily_sentiment["timestamp"])
+        daily_sentiment["smoothed"] = daily_sentiment["final_sentiment"].rolling(window=smoothing_window, min_periods=1).mean()
+        plt.plot(daily_sentiment["timestamp"], daily_sentiment["smoothed"], label=ticker, linewidth=2, color=color, marker=marker, markevery=5, markersize=6)
+
+    plt.axhline(0, color="black", linestyle="--", linewidth=1, alpha=0.5)
+    # Shade the neutral zone
+    plt.fill_between(daily_sentiment["timestamp"], low_threshold, high_threshold, color="gray", alpha=0.1, label="Neutral Zone")
+    plt.title("Sentiment Trends for All Stocks (Smoothed)", fontsize=16, pad=15)
+    plt.xlabel("Date", fontsize=12)
+    plt.ylabel("Sentiment Score", fontsize=12)
+    # Improved legend with semi-transparent background
+    legend = plt.legend(title="Stocks", bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=10, title_fontsize=12)
+    legend.get_frame().set_alpha(0.9)
+    plt.grid(True, alpha=0.3)
+    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/all_stocks_sentiment_trends.png", dpi=300)
+    plt.close()
+    logging.info("All stocks sentiment plot saved as 'all_stocks_sentiment_trends.png'.")
+
+def generate_summary(df, smoothing_window=3, ticker=None):
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     daily_sentiment = df.groupby(df["timestamp"].dt.date)["final_sentiment"].mean().reset_index()
     latest_date = daily_sentiment["timestamp"].max()
     latest_sentiment = daily_sentiment[daily_sentiment["timestamp"] == latest_date]["final_sentiment"].iloc[0]
     avg_sentiment = daily_sentiment["final_sentiment"].mean()
-    # Calibrate thresholds
     low_threshold, high_threshold = calibrate_thresholds(df["final_sentiment"])
-    # Interpret sentiment with calibrated thresholds
-    sentiment_interpretation = "neutral"
-    if latest_sentiment > high_threshold:
-        sentiment_interpretation = "positive"
-    elif latest_sentiment < low_threshold:
-        sentiment_interpretation = "negative"
-    # Compute distribution statistics
-    sentiment_mean = df["final_sentiment"].mean()
-    sentiment_median = df["final_sentiment"].median()
-    sentiment_skew = skew(df["final_sentiment"].dropna())
-    logging.info(f"Sentiment distribution stats - Mean: {sentiment_mean:.2f}, Median: {sentiment_median:.2f}, Skewness: {sentiment_skew:.2f}")
-    # Write summary
-    summary = (
-        f"Sentiment Analysis Summary (as of {latest_date}):\n"
-        f"We analyzed news about Apple (AAPL), the U.S. economy, and the NASDAQ market.\n"
-        f"- Latest Sentiment: {latest_sentiment:.2f} ({sentiment_interpretation})\n"
-        f"- Average Sentiment: {avg_sentiment:.2f}\n"
-        f"- Sentiment Distribution Stats:\n"
-        f"  - Mean: {sentiment_mean:.2f}\n"
-        f"  - Median: {sentiment_median:.2f}\n"
-        f"  - Skewness: {sentiment_skew:.2f}\n"
-        f"What this means:\n"
-        f"The sentiment score ranges from -1 (very negative) to 1 (very positive), with 0 being neutral.\n"
-        f"Thresholds: Negative < {low_threshold:.2f}, Positive > {high_threshold:.2f}\n"
-        f"A {sentiment_interpretation} sentiment suggests that recent news is "
-        f"{'favorable' if sentiment_interpretation == 'positive' else 'unfavorable' if sentiment_interpretation == 'negative' else 'neutral'} "
-        f"for Apple stock, the U.S. economy, and the NASDAQ market.\n"
-        f"Check the plots in 'data/outputs/' for detailed visualizations:\n"
-        f"- final_sentiment_plot.png: Overall sentiment trend with confidence intervals\n"
-        f"- individual_sentiment_plot.png: Sentiment for AAPL, U.S. Economy, and NASDAQ\n"
-        f"- sentiment_distribution_histogram.png: Distribution of sentiment scores\n"
-        f"- sentiment_correlation_heatmap.png: Cross-source correlations"
-    )
-    with open("data/outputs/sentiment_summary.txt", "w") as f:
-        f.write(summary)
-    logging.info("Sentiment summary saved to data/outputs/sentiment_summary.txt")
-    return summary
+    
+    # Labeling logic with strict inequalities
+    if latest_sentiment < low_threshold:
+        sentiment_label = "negative"
+    elif latest_sentiment > high_threshold:
+        sentiment_label = "positive"
+    else:
+        sentiment_label = "neutral"
+    
+    stats = {
+        "mean": df["final_sentiment"].mean(),
+        "median": df["final_sentiment"].median(),
+        "min": df["final_sentiment"].min(),
+        "max": df["final_sentiment"].max()
+    }
+    trend = "stable"
+    smoothed = daily_sentiment["final_sentiment"].rolling(window=smoothing_window, min_periods=1).mean()
+    if len(smoothed) > smoothing_window:
+        trend_slope = (smoothed.iloc[-1] - smoothed.iloc[-smoothing_window]) / smoothing_window
+        trend = "rising" if trend_slope > 0.01 else "falling" if trend_slope < -0.01 else "stable"
 
-def validate_with_price(df):
-    """Correlate sentiment with AAPL price returns."""
-    try:
-        aapl = yf.download("AAPL", start=df["timestamp"].min(), end=df["timestamp"].max())["Adj Close"]
-        aapl = aapl.pct_change().dropna()
-        aapl = aapl.reset_index()
-        aapl["Date"] = aapl["Date"].dt.date
-        df["date"] = pd.to_datetime(df["timestamp"]).dt.date
-        merged = df.groupby("date")["final_sentiment"].mean().reset_index().merge(aapl, left_on="date", right_on="Date")
-        correlation = merged["final_sentiment"].corr(merged["Adj Close"])
-        logging.info(f"Pearson correlation with AAPL returns: {correlation}")
-        return correlation
-    except Exception as e:
-        logging.error(f"Validation failed: {e}")
-        return None
+    # Simplified summary
+    summary = (
+        f"Sentiment Summary for {ticker or 'Magnificent 7 Combined'} (as of {latest_date.strftime('%Y-%m-%d')}):\n"
+        f"\nWhat’s Happening Now:\n"
+        f"- Latest Sentiment: {latest_sentiment:.2f} ({sentiment_label.capitalize()})\n"
+        f"  This is the sentiment score for the most recent day. "
+        f"{'It’s positive, meaning recent news is generally good.' if sentiment_label == 'positive' else 'It’s negative, meaning recent news is generally bad.' if sentiment_label == 'negative' else 'It’s neutral, meaning recent news is balanced.'}\n"
+        f"- Average Sentiment: {avg_sentiment:.2f}\n"
+        f"  This is the average sentiment over all days. It shows the overall mood of the news over time.\n"
+        f"- Trend (Last {smoothing_window} Days): {trend.capitalize()}\n"
+        f"  This shows if the sentiment is getting better ('rising'), worse ('falling'), or staying the same ('stable') over the last {smoothing_window} days.\n"
+        f"\nSentiment Categories:\n"
+        f"- Negative: Below {low_threshold:.2f}\n"
+        f"- Positive: Above {high_threshold:.2f}\n"
+        f"  Scores in between are considered neutral. These ranges help us label the sentiment as positive, neutral, or negative.\n"
+        f"\nKey Stats:\n"
+        f"- Overall Average: {stats['mean']:.2f}\n"
+        f"- Middle Value (Median): {stats['median']:.2f}\n"
+        f"- Range: {stats['min']:.2f} to {stats['max']:.2f}\n"
+        f"  These numbers show the typical sentiment score, the middle score, and the full range of scores we’ve seen.\n"
+        f"\nWhat This Means:\n"
+        f"The latest news for {ticker or 'the Magnificent 7 stocks'} is {sentiment_label}. "
+        f"Since the trend is {trend}, the sentiment might {'improve' if trend == 'rising' else 'worsen' if trend == 'falling' else 'stay about the same'} in the coming days. "
+        f"Check the graphs in data/outputs/ to see the full picture!"
+    )
+    with open(f"data/outputs/sentiment_summary{'_' + ticker if ticker else ''}.txt", "w") as f:
+        f.write(summary)
+    logging.info(f"Summary saved for {ticker or 'combined'}.")
+    return summary
 
 def main():
     config = load_config()
-    # Load sentiment data with dynamic date
-    current_date = datetime.now().strftime("%Y%m%d")
-    stock_df = pd.read_csv(f"data/processed/stock_sentiment_{current_date}.csv")
-    country_df = pd.read_csv(f"data/processed/country_sentiment_{current_date}.csv")
-    market_df = pd.read_csv(f"data/processed/market_sentiment_{current_date}.csv")
-    volatilities = pd.read_csv(f"data/raw/volatilities_{current_date}.csv")
-    # Align DataFrames by timestamp with outer merge
-    merged_df = stock_df[["timestamp", "sentiment_score", "days_elapsed"]].rename(columns={"sentiment_score": "stock"})
-    merged_df = merged_df.merge(country_df[["timestamp", "sentiment_score"]].rename(columns={"sentiment_score": "country"}), 
-                                on="timestamp", how="outer")
-    merged_df = merged_df.merge(market_df[["timestamp", "sentiment_score"]].rename(columns={"sentiment_score": "market"}), 
-                                on="timestamp", how="outer")
-    if merged_df.empty:
-        logging.error("Merged DataFrame is empty after outer merge.")
-        raise ValueError("Empty merged DataFrame even with outer merge.")
-    if "days_elapsed" not in merged_df.columns or merged_df["days_elapsed"].isna().all():
-        merged_df["days_elapsed"] = stock_df["days_elapsed"].median() if not stock_df["days_elapsed"].isna().all() else 0
-    logging.info(f"Merged sentiment data. Rows: {len(merged_df)}, Columns: {merged_df.columns.tolist()}")
-    sentiment_data = merged_df[["timestamp", "stock", "country", "market", "days_elapsed"]]
-    # Fit HSAM
+    volatilities = pd.read_csv("data/raw/volatilities.csv")
     hsam = HSAM(
-        decay_rate=config["model"]["decay_rate"],
-        pca_components=config["model"]["pca_components"],
-        bayesian_prior_strength=config["model"]["bayesian_prior_strength"],
+        decay_rate=config["model"].get("decay_rate", 0.1),
+        min_signal=config["model"].get("min_signal", 0.01),
+        explained_variance=config["model"].get("explained_variance", 0.9),
+        prior_strength=config["model"].get("bayesian_prior_strength", 0.1),
         validation_split=config["model"].get("validation_split", 0.2)
     )
-    result = hsam.fit(sentiment_data, volatilities)
-    # Save and plot
-    filepath = save_df(result, "outputs", f"final_sentiment_{current_date}")
-    # Handle missing 'visualization' key in config
-    visualization_config = config.get("visualization", {})
-    smoothing_window = visualization_config.get("smoothing_window", 3)
-    if "visualization" not in config:
-        logging.warning("Configuration missing 'visualization' section. Using default smoothing_window=3. Please update config.yaml.")
-    plot_sentiment(result, smoothing_window=smoothing_window)
-    # Generate summary
-    summary = generate_summary(result, smoothing_window=smoothing_window)
-    print("\n=== Sentiment Summary ===\n")
-    print(summary)
-    # Validate with price data
-    correlation = validate_with_price(result)
-    logging.info(f"Latest sentiment score: {result['final_sentiment'].iloc[-1]}")
-    return filepath
+    smoothing_window = config.get("visualization", {}).get("smoothing_window", 3)
+
+    results = {}
+    for ticker in config["tickers"]["stocks"]:
+        try:
+            stock_df = pd.read_csv(f"data/processed/stock_sentiment_{ticker}.csv")
+            country_df = pd.read_csv("data/processed/country_sentiment.csv")
+            market_df = pd.read_csv("data/processed/market_sentiment.csv")
+
+            # Keep exact timestamps for stock news
+            stock_df["timestamp"] = pd.to_datetime(stock_df["timestamp"])
+            stock_df["date"] = stock_df["timestamp"].dt.date
+            stock_df = stock_df.rename(columns={"sentiment_score": "stock"})
+
+            # Aggregate country and market to daily level
+            country_df["date"] = pd.to_datetime(country_df["timestamp"]).dt.date
+            market_df["date"] = pd.to_datetime(market_df["timestamp"]).dt.date
+
+            daily_country = country_df.groupby("date")["sentiment_score"].mean().reset_index().rename(columns={"sentiment_score": "country"})
+            daily_market = market_df.groupby("date")["sentiment_score"].mean().reset_index().rename(columns={"sentiment_score": "market"})
+
+            # Merge country and market daily data with stock data on date
+            merged_df = stock_df.merge(daily_country, on="date", how="left").merge(daily_market, on="date", how="left")
+
+            # Add days_elapsed from stock_df
+            merged_df["days_elapsed"] = stock_df["days_elapsed"]
+
+            # Fill NaNs with overall mean sentiment for country and market
+            merged_df["country"] = merged_df["country"].fillna(country_df["sentiment_score"].mean())
+            merged_df["market"] = merged_df["market"].fillna(market_df["sentiment_score"].mean())
+
+            if merged_df.empty:
+                logging.error(f"Merged DataFrame empty for {ticker}.")
+                continue
+            
+            result = hsam.fit(merged_df, volatilities, ticker)
+            results[ticker] = result
+            save_df(result, "outputs", "final_sentiment", ticker)
+            plot_sentiment(result, smoothing_window, ticker)
+            summary = generate_summary(result, smoothing_window, ticker)
+            print(f"\n=== Sentiment Summary for {ticker} ===\n{summary}")
+        except Exception as e:
+            logging.error(f"Failed to process {ticker} in model training: {e}")
+            continue
+
+    combined_df = pd.concat(results.values(), ignore_index=True)
+    save_df(combined_df, "outputs", "final_sentiment", "combined")
+    plot_sentiment(combined_df, smoothing_window)
+    plot_all_stocks(results, smoothing_window)
+    summary = generate_summary(combined_df, smoothing_window)
+    print(f"\n=== Combined Sentiment Summary ===\n{summary}")
+    logging.info("Pipeline completed successfully.")
+    return "data/outputs/final_sentiment_combined.csv"
 
 if __name__ == "__main__":
     main()

@@ -26,24 +26,17 @@ def load_config():
         raise
 
 def exponential_decay(weight, decay_rate, time_elapsed):
-    """Apply exponential decay to weights."""
-    return weight * np.exp(-decay_rate * time_elapsed)
+    """Apply exponential decay to weights with a minimum threshold."""
+    return max(weight * np.exp(-decay_rate * time_elapsed), 0.01) if not pd.isna(weight) else 0
 
 def market_impact(score, slope=0.5):
-    """
-    Convert raw sentiment score to final sentiment with linear scaling and soft clipping.
-    Returns values between -1 and 1 with more uniform distribution.
-    """
-    # Initial linear scaling
-    scaled = score * slope
-    # Soft clipping using arctangent
-    return np.arctan(scaled) / (np.pi/2)
+    """Convert raw sentiment score to final sentiment with tanh transformation."""
+    return np.tanh(slope * score)
 
-def save_df(df, folder, filename):
-    """Save DataFrame to CSV with timestamp."""
+def save_df(df, folder, filename, ticker=None):
+    """Save DataFrame to CSV with optional ticker suffix."""
     os.makedirs(f"data/{folder}", exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d")
-    filepath = f"data/{folder}/{filename}_{timestamp}.csv"
+    filepath = f"data/{folder}/{filename}{f'_{ticker}' if ticker else ''}.csv"
     df.to_csv(filepath, index=False)
     logging.info(f"Saved DataFrame to {filepath}")
     return filepath
@@ -55,4 +48,4 @@ def days_elapsed(timestamp):
         pub_date = pd.to_datetime(timestamp)
         return (current_date - pub_date).days
     except Exception:
-        return 0  # Default to 0 if parsing fails
+        return 0
