@@ -29,10 +29,6 @@ config/config.yaml
 config/*.yaml
 *.env
 
-# Data files
-data/raw/
-data/processed/
-data/outputs/
 
 # Environment
 .env

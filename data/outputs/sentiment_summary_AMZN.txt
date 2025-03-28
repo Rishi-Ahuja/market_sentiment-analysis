@@ -1,0 +1,23 @@
+Sentiment Summary for AMZN (as of 2025-03-26):
+
+What’s Happening Now:
+- Latest Sentiment: -0.05 (Positive)
+  This is the sentiment score for the most recent day. It’s positive, meaning recent news is generally good.
+- Average Sentiment: -0.04
+  This is the average sentiment over all days. It shows the overall mood of the news over time.
+- Trend (Last 3 Days): Falling
+  This shows if the sentiment is getting better ('rising'), worse ('falling'), or staying the same ('stable') over the last 3 days.
+
+Sentiment Categories:
+- Negative: Below -0.05
+- Positive: Above -0.05
+  Scores in between are considered neutral. These ranges help us label the sentiment as positive, neutral, or negative.
+
+Key Stats:
+- Overall Average: -0.05
+- Middle Value (Median): -0.05
+- Range: -0.50 to 0.99
+  These numbers show the typical sentiment score, the middle score, and the full range of scores we’ve seen.
+
+What This Means:
+The latest news for AMZN is positive. Since the trend is falling, the sentiment might worsen in the coming days. Check the graphs in data/outputs/ to see the full picture!
